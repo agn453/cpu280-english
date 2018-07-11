@@ -1,0 +1,394 @@
+	title	'Format Handling Routines of CP/M-3 BIOS'
+	.z280
+	.xlist
+	maclib	Z280EQU
+	maclib	CPU280
+	maclib	OPTIONS
+	.list
+
+; 230191 Tilmann Reh
+; 930103 TR: RESDMA --> DMA, xLENGTH --> xxLEN, WDMAPB --> WRDMAPB
+; 930104 TR: READ1/WRITE1 --> DSKRD1/DSKWR1
+; 950109 TR: HD-Bug also when formatting, attempts reduced to 2
+
+; 10-July-2017 Tony Nicholson
+; Comments translated from German to English (using Google
+; Translate with some appropriate language adjustments resulting
+; from an examination of the instruction sequences).  Also
+; corrected the syntax to be compatible with Hector Peraza's
+; ZSM4 Z80/Z180/Z280 assembler 
+
+	dseg			; Called by 'System Call', so thank you!
+
+; USERF is used here for various special BIOS functions.
+; An address is passed in BC with a function code in E.
+; All functions refer to the currently logged in drive
+; (DRIVE,CURDPH,DRVTYP).
+; Undefined functions cause an ERROR-TRAP.
+
+userf::	ld	a,e		; F-Code
+	cp	maxfun
+	jr	nc,tohigh	; function number too high: TRAP
+	add	a,a
+	exts	a		; double it in HL
+	ldw	hl,(hl++usetab)	; Lookup address of routine from table
+	jp	(hl)		; Call the routine (RET --> SYSRET)
+
+usetab:	defw	vrsion		; 0 : Get BIOS Version Number
+	defw	setdel		; 1 : Set Motor-Off Delay
+	defw	getdrv		; 2 : Get Selected Drive
+	defw	gettyp		; 3 : Get Selected Drive Type
+	defw	pseek		; 4 : Set Physical Track Direct (Seek)
+	defw	checkd		; 5 : Check Density
+	defw	readid		; 6 : Read ID
+	defw	readp		; 7 : Read Physical Sector
+	defw	writep		; 8 : Write Physical Sector
+	defw	format		; 9 : Format a Track
+	defw	setfrm		;10 : Set BIOS Parameter Blocks
+	defw	getres		;11 : Get Result Address
+	defw	check		;12 : Error-Check
+	defw	rddiag		;13 : Read Track Diagnostic
+maxfun	equ	($-usetab) shr 1 ; Number of functions
+
+; undefined call (wrong function number): TRAP message
+
+tohigh:	pop	hl		; (SYSRET)
+	pop	hl		; (MSR)
+	pop	hl		; (next instruction)
+	push	de		; Function code
+	ld	hl,trpmsg
+	call	pmsg##		; Output 'BIOS-TRAP at ' message
+	ldctl	hl,usp		; Stack of calling program
+	ldw	hl,(hl)		; get calling address
+	dec	hl
+	dec	hl
+	dec	hl		; It is 3 Bytes before Return address (at CALL)
+	call	hexadr##	; Output address
+	ld	hl,fcode
+	call	pmsg##		; Output ' Function = '
+	pop	hl		; Function code
+	ld	h,0
+	call	pdec##		; Output Function code in decimal
+	jp	wboot##		; Warm-Boot
+	
+;***********************************************************************
+;**                    Get USERF Version Number                       **
+;***********************************************************************
+; USERF Version number is transferred to HL in binary form (H=main,L=update)
+; This version number is not the BIOS revision. Instead it describes the
+; status (version) of the USERF interface.
+
+vrsion:	ld	hl,101h		; UserF Version 1.01
+	ret
+
+;***********************************************************************
+;**                      Set Motor-Off Delay                          **
+;***********************************************************************
+; Motor Off Delay word in 10ms increments. Value in BC.
+
+setdel:	ld	(delay##),bc	; Set the new delay
+	ret			; return (SWI1)
+
+;***********************************************************************
+;**                      Get Selected Drive                           **
+;***********************************************************************
+; The currently selected drive is returned in HL.
+
+getdrv:	ld	a,(drive##)
+	exts	a
+	ret
+
+;***********************************************************************
+;**                          Get Type                                 **
+;***********************************************************************
+; Query drive type (value from NVRAM). Result in HL (2..7).
+
+gettyp:	ld	a,(drvtyp##)	; current drive type
+	exts	a
+	ret
+
+;***********************************************************************
+;**               Set Physical Track Direct (Seek)                    **
+;***********************************************************************
+; Track is transferred to (B)C. No duplication at 48 TPI !
+
+pseek:	push	bc
+	call	motonw##	; Motor on
+	pop	bc
+	ld	a,c
+	call	seek##		; SEEK-Routine in DISKIO
+	jp	motoff##
+
+;***********************************************************************
+;**                  Check Density (via ID-Read)                      **
+;***********************************************************************
+; At the current drive position perform a Density Check. Checks if
+; DENSE and clock setting is valid. Call with selected HEAD in C (0/1).
+; On return: H=FF on error, otherwise H=0. If successful L conatins
+; the detected density (1=FM,2=MFM,4=HD-MFM).
+
+checkd:	call	gthead		; evaluate HEAD from C
+	call	motonw##
+	call	chkden##	; Check density
+	push	af
+	call	motoff##
+	pop	af
+	ld	h,-1
+	ret	c		; Time-Out
+	ret	nz		; Error
+	ld	hl,4
+	ld	a,(ldflag##)
+	or	a		; Low-Density?
+	ret	z		; HD : RET with HL=0004
+	ld	a,(dense##)
+	or	a
+	ld	l,2
+	ret	nz		; MFM : RET with HL=0002
+	dec	l		; FM : HL=0001
+	ret
+
+;***********************************************************************
+;**                   Read next ID Information                        **
+;***********************************************************************
+; All settings are taken from prior call of CHECKD. Head in C.
+; 200ms status check counter is incremented each time to allow the Format-
+; Manager to get the right order.
+
+readid:	call	gthead		; get HEAD from C
+	ld	(cnt10-1),20	; *** Status Check counter at Maximum
+	call	motonw##
+	ld	a,(dense##)	; current density
+	call	chkd2##		; READ ID
+	push	af
+	call	motoff##
+	pop	af
+	ld	hl,-1
+	ret	c		; Time-Out:
+	ret	nz		; Error: RET with FFFF
+	inc	hl
+	ret			; OK: RET with HL=0
+
+;***********************************************************************
+;**                   Read Physical Sector                            **
+;***********************************************************************
+; Input:   BC points to buffer area. In it: 'C H R N' for FDC.
+;          It is always read on page 0 (Parameter!).
+; Output:  Buffer filled with read data.
+;          Error free when HL=0, errors with HL=FFxx.
+
+readp:	ld	(DMA),bc	; save destination address
+	ld	a,1
+	ld	(dbnk),a	; Select bank 1
+	call	getbuf		; copy from BC to BUFFER
+	call	motonw		; Motor ON and wait
+	ld	hl,pdrive
+	res	2,(hl)		; physically always Head 0
+	ld	hl,(buffer)	; L=Cylinder, H=Head
+	ld	(ptrack),hl
+	ld	a,l
+	call	seek		; Track in A
+	ld	hl,(buffer+2)
+	ld	(psect),hl	; Transfer record and sector shift
+	ld	a,l
+	ld	(eot),a		; EOT = Record
+	ld	a,h
+	call	setln1		; set length for DMA
+	ld	hl,(curdph)
+	dec	hl
+	dec	hl		; Pointer for Bit-Flags
+	push	(hl)		; save all Flags in buffer
+	push	hl		; save buffer pointer
+	res	3,(hl)		; reset current Invert-Flag
+	ld	(quiet),-1	; no error messages!
+	call	DskRd1		; Sector read
+	ld	(quiet),0	; Re-enable error messages
+	pop	hl		; restore pointer to Bit-Flags
+	pop	(hl)		; save flags in buffer
+	ld	hl,0
+	or	a
+	ret	z		; ok: HL=0
+	dec	hl		; otherwise HL=FFFF: Read error
+	ret
+
+;***********************************************************************
+;**                   Write Physical Sector                           **
+;***********************************************************************
+; All data is taken from the previous READ, Also DMA address!
+; Output HL: 0 ok, FFFF Write error, FFFE Write Protected.
+
+writep:	call	motonw##	; Motor On and wait
+	ld	hl,(curdph##)
+	dec	hl
+	dec	hl		; Point to Bit-Flags
+	push	(hl)		; save Flags
+	push	hl		; save buffer pointer
+	res	3,(hl)		; reset current Invert-Flag
+	call	DskWr1		; Sector write
+	pop	hl		; restore buffer pointer to bit flags
+	pop	(hl)		; save them
+	ld	hl,0
+	or	a
+	ret	z		; ok: HL=0000
+	dec	hl
+	cp	2		; A=2 : WP ?
+	ret	nz		; Write error: HL=FFFF
+	dec	hl
+	ret			; WP : HL=FFFE
+
+;***********************************************************************
+;**                        Format A Track                             **
+;***********************************************************************
+; Inputs: BC points to buffer, which contains the following values:
+; Pointer to index data (CHRN) : Integer;
+; Density, Head, SecShift, SecZahl, Gap3, Filler : Byte;
+; Ergebnis: FFFF = Write error, FFFD = NotReady, 0000 = ok
+
+; 910113 TR: Density specification is ignored because the BIOS parameters
+; are already valid!
+; (In Format Manager 'Edit external format' is already activated)
+
+format:	call	getbuf		; Fetch Parameter from buffer
+	ld	hl,(buffer)	; Pointer to CHRN table
+	ld	(DMA),hl	; use DMA address
+	ld	(dbnk),1	; DMA-Bank : 1 (TPA)
+	iopage	boardp
+	call	SetClk		; Set Low/High Density FDC clock bits
+	ld	hl,(buffer+2)	; L = Density, H = Head
+	ld	a,0Dh
+	dec	l		; --> 0,1,3
+	jr	z,form1		; FM : Command = 0D
+	ld	a,4Dh		; MFM/HD : Command = 4D
+form1:	ld	(buffer+2),a	; Save as Command byte
+	ld	a,h		; Head 0..1
+	rlca
+	rlca			; --> in Bit 2
+	or	a,(drive)	; Drive to it
+	ld	(buffer+3),a	; save as US/HS
+	ld	a,(buffer+5)	; Sectors per Track
+	multu	a,4		; HL = Number of bytes for DMA-Transfer
+	ld	(WrLen),hl	; save it in DMA parameter block
+	call	motonw		; Motor ON and wait
+	ldw	(retry),FrmRtr	; Save address in JP for retries
+FrmRtr:	ld	bc,602h		; maximum 2 attempts, 6 Byte command length
+formlp:	push	bc
+	ldw	(cmdadr),buffer+2 ; save command pointer at short notice here
+	ld	de,WrDmaPB
+	call	dskio		; start DMA and FDC
+	ldw	(cmdadr),clist	; Commands again from CLIST (possibly in TIMERR!)
+	pop	bc
+	call	c,timerr	; Time-Out: ask User
+	jr	c,formxe	; Cancel: End with HL=FFFF
+	call	errchk		; Any errors?
+	ld	hl,0
+	jr	z,formex	; no: End with 0000 as result
+	call	ChkBug		; at error: is it HD-Bug? 
+	jr	c,FrmRtr	; yes: from the beginning, with WorkAround
+	dec	c
+	jr	nz,formlp	; otherwise max. 2 retries
+formxe:	ld	hl,-1		; Error: Return with FFFF
+formex:	exx			; Save result
+	call	motoff		; Motor OFF
+	ld	hl,(RdLen)
+	ld	(WrLen),hl	; Restore DMA length
+	exx			; Result code in HL
+	ret
+
+;***********************************************************************
+;**                   Set BIOS Parameter Blocks                       **
+;***********************************************************************
+; Parameter blocks of the currently detected are described.
+
+setfrm:	call	getbuf		; (BC) copy to BUFFER
+	jp	actdpb		; SET Parameter block, RET
+
+;***********************************************************************
+;**                        Get Result Address                         **
+;***********************************************************************
+; Address of 'CHRN' in RESULT is transferred to HL.
+
+getres:	ld	hl,result##+3
+	ret
+
+;***********************************************************************
+;**                         Error-Check                               **
+;***********************************************************************
+; RESULT is linked to corresponding masks. HL=0 ok, FFFF not ok.
+
+check:	call	errchk##
+	ld	hl,0
+	ret	z		; ok: RET with 0000
+	dec	hl
+	ret			; sonst FFFF
+
+;***********************************************************************
+;**                     Read Track Diagnostic                         **
+;***********************************************************************
+; Read a whole track (data is discarded). FDC clock must be correct.
+; Input:   BC points to buffer area. It contains: 'C H R N' for FDC
+;          (1st. Sector) then total length (Word), Header (bit) and
+;          EOT (byte).
+; Output:  Flag in HL: 0=error free, with errors HL=FFxx.
+
+rddiag:	call	getbuf		; Copy Buffer into System-Bank
+	ld	hl,(buffer)
+	ld	(ptrack),hl	; Set C H
+	ld	hl,(buffer+2)
+	ld	(psect),hl	; Set R N
+	ld	hl,(buffer+4)
+	ld	(geslen),hl	; Total length in Bytes
+	ld	bc,(buffer+6)	; C=Head, B=EOT
+	call	gthead		; Insert Head in pdrive
+	ld	a,b
+	ld	(eot),a		; put last sector
+	ld	hl,dmapb
+	call	dmaset		; enable DMA
+	ld	a,(dense)
+	or	2		; FDC Command: READ DIAGNOSTIC (READ TRACK)
+	ld	(clist),a
+	ld	b,9
+	call	intcom		; Start FDC
+	ld	hl,-1
+	ret	c		; Time-Out: End with HL=FFFF
+	ld	a,(result)	; FDC Status 0
+	and	10010000b	; Normal and Abnormal Termination are ok!
+	ret	nz		; Invalid Command or Equipment Check (Home)
+	ld	a,(result+1)	; FDC Status 1
+	and	00110011b	; DE,OR,NW,MA are errors (ignore EN,ND)
+	ret	nz
+	ld	a,(result+2)	; FDC Status 2
+	and	01110111b	; CM,DD,WC,SN,BC,MD are errors (SH is ok)
+	inc	hl	
+	ret			; ok: HL=0
+
+dmapb:	defb	dal0		  ; DMA 0
+	defw	diadum
+	defb	81h		  ; Dest: Dummy-Byte in System-Bank
+	defb	fdcdack,0,boardp  ; Src FDCDACK
+geslen: defs	2		  ; Total length
+	defw	1110000010000100b ; DMA 0 burst enable, Read, noInc
+diadum:	defs	1
+
+; Common for some functions:
+; (BC) copy to BUFFER (128 Bytes).
+
+getbuf:	ld	d,b
+	ld	e,c		; Source address to DE
+	ld	bc,1		; DestBank 0, SrcBank 1
+	call	xmove##		; Select Banks
+	ld	hl,buffer##	; Destination bank
+	ld	bc,128		; Length of Parameter blocks
+	jp	move##		; Transfer it to the Buffer
+
+; Use Head from C to PDRIVE
+
+gthead:	ld	hl,pdrive##
+	res	2,(hl)		; assume Head 0
+	bit	0,c
+	ret	z
+	set	2,(hl)		; MSB set: Head 1
+	ret
+
+trpmsg:	defm	bel,cr,lf,'BIOS-TRAP at ',0
+fcode:	defm	', Function = ',0
+
+	end

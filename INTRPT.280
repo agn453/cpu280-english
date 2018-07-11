@@ -1,0 +1,611 @@
+	title	'Interrupt/Trap Handling Routines of CP/M-3 BIOS'
+	.z280
+	.xlist
+	maclib	Z280EQU
+	maclib	CPU280
+	maclib	OPTIONS
+	.list
+
+TestLdr	equ	false	; SC LODLDR for testing new Loader versions
+
+; 950203 Tilmann Reh
+
+; 10-July-2017 Tony Nicholson
+; Comments translated from German to English (using Google
+; Translate with some appropriate language adjustments resulting
+; from an examination of the instruction sequences).  Also
+; corrected the syntax to be compatible with Hector Peraza's
+; ZSM4 Z80/Z180/Z280 assembler 
+
+ints	equ	i$c + i$ct0	; All Interrupts to be released
+
+	dseg			; All INT/Trap handling in System Mode
+
+;***********************************************************************
+;**                  Editing Traps (System Calls etc.)                **
+;***********************************************************************
+
+    if loader
+public	FdcInt,TimInt		; for Loader access to the floppy and timer
+    else			; entire SC/Trap handling is not in the loader
+
+; System Call is used for calling BIOS functions.
+; No registers (except Flags) changed.
+
+syscal::ld	(hlsav),hl	; Save HL
+	ld	(asav),a	; Save A
+	pop	hl		; Get Operand off the (system) stack
+	dec	h
+	jr	z,biossc	; H was 1, now 0 : Character-I/O BIOS Functions
+	inc	h
+
+; Calling system functions via SC : The parameter has a checksum integrity test
+
+	ld	a,l		; L is function code, H is (256-function code)
+	cp	max_sc
+	jr	nc,sctrap	; SC function code too high: TRAP
+	add	a,h		; +H+1 (DEC H compensated) checksum should be 0
+	jr	nz,sctrap	; invalid SC-Operand: TRAP
+	ld	h,0
+	add	hl,hl
+	ldw	hl,(hl+sctab)	; Address of BIOS Routine in HL
+	push	sysret		; System Return address to stack
+	push	hl		; BIOS Routine address to stack
+	ld	hl,(hlsav)	; restore HL
+	ld	a,(asav)	; and A registers
+xret:	ret			; Call BIOS Routine, RET --> SYSRET
+sysret:	retil			; Return back to calling program in User mode
+
+sctrap:	push	hl		; Save Operand
+	ld	hl,scmsg
+	call	pmsg		; Output TRAP message
+	pop	hl
+	call	hexadr		; Output operand in hexadecimal
+	ld	hl,atmsg
+	call	pmsg		; Output 'at'
+	pop	hl		; (MSR)
+	pop	hl		; next instruction
+	lda	hl,(hl-4)	; 4 Bytes back
+	call	hexadr		; Output Address of trap
+	jp	wboot		; --> CCP
+
+; System Call for direct BIOS functions (Character-I/O):
+; With argument H=0, L=Function number (from 0).
+
+biossc:	ld	a,l
+	cp	max_bsc
+	jr	nc,sctrap	; Too high SC-Function: TRAP
+	push	ix		; Save IX (used by BIOS routines)
+	add	hl,hl		; (H is still 0)
+	ldw	hl,(hl+bsctab)	; Address of BIOS-Routine in HL
+	push	retbios		; Return address to Stack
+	push	hl		; BIOS destination address on Stack
+	ld	hl,(hlsav)	; Restore HL
+	ld	a,(asav)	;  and A registers
+	ret			; Call the BIOS-Routine, RET --> SYSRET
+retbios::push	bc
+	ld	b,l
+	iopage	busp		; Select BusP I/O (possibly for user I/O)
+	ld	l,b
+	pop	bc
+	pop	ix		; Restore IX register (used by TURBO,ZPM3)
+	retil			; (IY is not used by the BIOS)
+
+; Table of System-Functions accessed via SC (System Call)
+
+				; code
+sctab:	defw	xret		; 0000 reserved for BDOS
+	defw	reboot		; FF01 Reload CCP and Jump Vectors
+	defw	dmaset		; FE02 DMA-Transfer init.
+	defw	setmod		; FD03 *** Set System/User Mode ***
+    if TestLdr
+	defw	lodldr		; FC04 for Loader-Test
+    endif
+max_sc	equ	($-sctab)/2	; Number of defined SC-Functions
+
+; Table of character I/O functions accessed via the SC function code 01xx
+; (these routines may also be called directly from a user program)
+
+bsctab:	defw	devini		; 0100 Init I/O Device
+	defw	const		; 0101 Console Input Status
+	defw	conin		; 0102 Console Input
+	defw	conost		; 0103 Console Output Status
+	defw	conout		; 0104 Console Output
+	defw	listst		; 0105 List Output Status
+	defw	list		; 0106 List Output
+	defw	auxist		; 0107 Auxiliary Input Status
+	defw	auxin		; 0108 Auxiliary Input
+	defw	auxost		; 0109 Auxiliary Output Status
+	defw	auxout		; 010A Auxiliary Output
+	; although not CharIO, the following are also directly accessible
+	defw	time		; 010B RTC support
+	defw	movex		; 010C Interbank Block Move
+	defw	userf		; 010D User Function (Format Manager)
+max_bsc	equ	($-bsctab)/2	; Number of defined BIOS-SC's
+
+; Switch to System/User Mode (for SELMEM) depending on A (Bank).
+; Beware when calling via SC because of different Stacks!!
+
+setmod:	pop	hl		; (sysret)
+	or	a		; Bank to be selected in Reg A
+	jr	z,setmod1	; Do nothing if Bank 0: System-Mode always ok
+	cp	(lastbk)
+	jr	z,setmod1	; Bank <> 0 already loaded in MMU: do nothing
+	push	af
+	push	bc		; Save needed registers
+	iopage	mmup
+	dec	a		; a = 0,1,2,3 for Bank 1..4
+	multu	a,30		; Calculate MMU table (30 bytes per Bank)
+	lda	hl,(hl+UsrMMU)	; HL from table for User-Mode PDR's
+	xor	a
+	out	(pdr),a		; Page Descrip. Pointer = 0
+	ld	bc,0F00H+bmp	; Block Move the 15 words to the MMU
+	otirw			;  via MMU programming port
+	iopage	busp		; Return to ECB-Bus I/O page
+	pop	bc
+	pop	af		; Restore registers
+	ld	(lastbk),a	; Save the bank number now selected
+setmod1:pop	hl		; MSR
+	res	6,h		; Set System Mode bit
+	or	a		; Test which Bank
+	jr	z,modret	; A=0 : System Mode
+	set	6,h		; A>0 : User Mode
+modret:	push	hl
+	ld	hl,(hlsav)	; Restore HL
+	retil
+
+;### Reloading a new Loader for the test.
+; Input: Address (in TPA) in DE.
+; Length is a fixed 3000h (according to EPROM range).
+
+    if TestLdr
+lodldr:	ld	bc,1		; Source Bank 1, Dest. Bank 0
+	call	xmove
+	ld	hl,0		; Dest. Address
+	ld	bc,3000h	; Length
+	call	move
+	jp	200h		; Test entry point
+    endif
+
+; NMI: Restart the CCP. Test...
+
+NMInt:	ld	sp,XStack	; first set the System-Stack
+	ld	a,(SCB+18h)
+	call	HexByt
+	ld	c,'-'
+	call	ConOut
+	ld	hl,SCB+18h
+	res	7,(hl)
+;	ld	a,(hl)
+;	and	5Fh
+;	ld	(hl),a		; Reset CCP-Running flag
+	push	WBoot		; new PC: Warmstart Entry point
+	push	ints		; new MSR: System Mode, "Ints" enable
+	retil			; so that CPU-internal Flags are correct...
+
+; Privileged-Instruction Trap:
+; EI and DI are accepted, all others act like a WBOOT.
+
+privil:	pop	(msrsav)	; (MSR)
+	ld	(hlsav),hl	; Save HL
+	pop	hl		; Trap Address to HL
+	push	af		; Save AF
+	ldup	a,(hl)		; Get Trapped Opcode
+	cp	0F3h		; DI ?
+	jr	z,privdi
+	cp	0FBh		; EI ?
+	jr	z,privei
+	pop	af		; Get original AF from Stack
+	push	hl
+	ld	hl,primsg
+	call	pmsg		; Output Privilege message
+	pop	hl
+	call	hexadr		; Output Address
+	ld	c,':'
+	call	co		; Output ':' seperator
+	ld	b,3
+privlp:	ldup	a,(hl)		; Output 3 bytes of Opcode from User-Mode
+	call	hexbyt		;  in hex
+	inc	hl
+	djnz	privlp
+	jp	wboot		; Reboot, back to the CCP
+
+privdi:	pop	af		; Original-AF
+	inc	hl
+	push	hl		; Return Address to stack
+	ld	hl,(msrsav)	; Get saved Master Status Register
+	ld	l,0		; All Interrupts Disabled
+	push	hl		; MSR to Stack
+	ld	hl,(hlsav)	; Restore Original-HL
+	retil			; back to the user application
+
+privei:	pop	af		; Original-AF
+	inc	hl
+	push	hl		; Return Address to stack
+	ld	hl,(msrsav)	; Get save Master Status Register
+	ld	l,ints		; Re-enable interrupts
+	push	hl		; MSR to Stack
+	ld	hl,(hlsav)	; Restore Original-HL
+	retil			; back to the user application
+
+; Division Exception Trap:
+
+divtrp:	pop	hl		; (MSR)
+	ld	hl,oflmsg	; Message for Div Overflow
+	jr	nz,divtrp1
+	ld	hl,divmsg	; It was Division by 0
+divtrp1:call	pmsg		; Output message
+	pop	hl		; followed by address
+	call	hexadr		;  in hex
+	jp	wboot		; --> CCP
+
+; Access Violation Trap:
+
+acctrp:	pop	hl		; (MSR)
+	ld	hl,accmsg
+	call	pmsg		; Output "Access Violation"
+	pop	hl
+	call	hexadr		; and address in hex
+	ld	hl,pdrmsg
+	call	pmsg
+	iopage	mmup		; I/O Page for MMU
+	in	a,(mmcr)
+	and	1Fh		; lower 5 Bits : PFI
+	call	hexbyt		; output PDR number
+	jp	wboot		; --> CCP
+
+; Text for TRAP messages:
+
+    if deutsch
+scmsg:	defz	'Verbotener System-Call '
+primsg:	defz	'Privilegierter Befehl bei '
+divmsg:	defz	'Division durch 0 bei '
+oflmsg:	defz	'Divisions-]berlauf bei '
+accmsg:	defm	'Unerlaubter Zugriff'
+atmsg:	defz	' bei '
+pdrmsg:	defz	' }ber PDR '
+    endif
+    if english
+scmsg:	defz	'Illegal System Call '
+primsg:	defz	'Privileged Instruction at '
+divmsg:	defz	'Zero Division at '
+oflmsg:	defz	'Division Overflow at '
+accmsg:	defm	'Access Violation'
+atmsg:	defz	' at '
+pdrmsg:	defz	' using PDR '
+    endif
+
+    endif	; (if not loader)
+
+;***********************************************************************
+;**           Interrupt control for the Floppy-Controller             **
+;***********************************************************************
+
+fdcint:	ex	(sp),hl		; ignore Reason Code, push HL
+	push	bc
+	push	af
+	ld	c,iop
+	ldctl	hl,(c)
+	push	hl		; Save Iopage
+	ld	l,boardp
+	ldctl	(c),hl		; Select Board-Page
+fdci1:	in	a,(fdcsta)
+	rla
+	jr	nc,fdci1	; wait for RQM
+	ld	hl,result	; Set pointer to Result
+	bit	5,a		; Check FDC Main Status Bit 4 (CB)
+	jr	z,chgsta	; Not Busy: Sense Interrupt Status
+
+; Read FDC-Result (Status) after RESULT
+
+rdres1:	in	a,(fdcsta)
+	rla
+	jr	nc,rdres1	; wait for FDC-RQM (Request for Master)
+	rla
+	jr	nc,fdci2	; FDC Input: End
+	in	a,(fdcdat)
+	ld	(hl),a		; Read Result and save
+	inc	hl		; Bump pointer
+	jr	rdres1		; continue to FDC Data direction input
+
+fdci2:	ld	(fdcrdy),1	; Set End-Flag (for R/W/Seek-command)
+fdcret:	pop	hl
+	ldctl	(c),hl		; Restore Iopage (C=IOP)
+	pop	af
+	pop	bc
+	pop	hl
+	retil
+
+; Change Status-Interrupts:
+
+chgsta:	ld	a,8		; FDC SENSE INTERRUPT STATUS
+	out	(fdcdat),a	; Command to FDC
+chgst1:	in	a,(fdcsta)
+	rla
+	jr	nc,chgst1	; wait for FDC-RQM
+	in	a,(fdcdat)	; Read FDC-ST0
+	cp	80h
+	jr	z,fdcret	; Invalid Command : End Status queries
+	bit	5,a
+	jr	z,chgst2
+	ld	(hl),a		; only with SEEK END : save ST0 (EC-Flag)
+	ld	(fdcrdy),1	; Set FDC-End-Flag (SEEK command)
+chgst2:	in	a,(fdcsta)
+	rla
+	jr	nc,chgst2	; wait for FDC-RQM
+	rla
+	jr	nc,chgsta	; FDC Input : next query
+	in	a,(fdcdat)	; otherwise read FDC-Output (ignore data)
+	jr	chgst2		; continue to FDC Input
+
+;***********************************************************************
+;**     Interrupt Control of the CPU-Timer 0  (cyclic 10 ms)          **
+;**          FDD - Status check every 0.2 Seconds                     **
+;***********************************************************************
+
+timint:	ex	(sp),hl		; ignore Reason Code, save HL
+	push	bc
+	push	af
+	ld	c,iop
+	ldctl	hl,(c)
+	push	hl		; Save current Iopage
+	ld	l,ctp
+	ldctl	(c),hl		; Select C/T-Page
+	ld	a,11100000b
+	out	(cs0),a		; reset CC and COR (INTACK)
+	ld	l,boardp
+	ldctl	(c),hl		; Select Board-I/O ( C=IOP )
+    if not loader
+	ld	hl,(delay)	; Preload HL with Delay-Time for MOTON
+	ld	a,(motflg)
+	or	a
+	jr	z,motof		; Motor OFF: switch off, preset DELCNT
+	rra
+	jr	c,setdly	; Motor still ON: no Delay (-> reset)
+	ld	hl,(delcnt)
+	ld	a,h
+	or	l		; DELCNT already 0 (Delay over)?
+	dec	hl		; if not: new value in HL
+	jr	nz,setdly	; Delay still running: save value
+	ld	(motflg),a	; Reset Flag : Motor now OFF ( A=0 )
+motof:	out	(mot_off),a	; switch off drive Motor
+setdly:	ld	(delcnt),hl	; Save counter value and continue
+	incw	(SysCnt)	; Increment System tick counter
+    endif
+	ld	hl,cnt10
+	decw	(hl)		; CNT10 decr.
+    if not loader
+	dec	hl
+	dec	(hl)		; 0.2s counter decr.
+	jr	z,secint	; 0.2 Seconds reached : FDD-Status check
+    endif
+timret:	pop	hl
+	ldctl	(c),hl		; Iopage rest.  ( C=IOP )
+	pop	af
+	pop	bc
+	pop	hl
+	retil
+
+; Interrupt every 0.2 seconds to detect disk changes.
+; Two methods are supported:
+; 1. Changes to the Write-Protect-Signals (WP)
+; 2. Modern Floppy Drives provide a Disk-Change-Signal (DCHG).
+; In principle, only the currently logged in drives are checked
+; For this reason the BIOS routines save a separate login vector
+; independent of that used by the BDOS.
+
+; The selection of one of the two methods is done for each drive
+; separated by the Option "ChgCap" in OPTIONS.LIB. For each
+; logged drive, the WP method requires approximately 0.033% of the
+; computation time; and the DCHG method about 0.109%. So it makes
+; sense to use the WP method.
+
+; If the disk is changed, the Media-Flag will be in the DPH and the global
+; Flag in the SCB will be set. At the next access (R/W) it is then
+; returned to A=FF
+; einloggt.  
+
+; Meaning of the active flag (Bit mask): For WP edge detection
+; Time delay after (new) login of a drive. At the first test,
+; only the WP state is detected.
+
+    if not loader
+
+SecInt:	ld	(hl),1		; next attempt after 10 ms (if FDC Busy)
+	ld	a,(FdcRdy)
+	or	a
+	jr	z,TimRet	; another Operation in progress: not this time
+	in	a,(FdcSta)	; Read FDC-Status
+	bit	4,a
+	jr	nz,TimRet	; FDC BUSY: No Status Request possible
+	ld	(hl),20		; Counter again to 20 (for next 200 ms)
+
+	push	de		; save DE
+	xor	a		; Drive-Code, Drive A:
+	ld	d,0001b		; Bit mask in D, active 1
+GetStL:	ld	hl,CurTks
+	add	hl,a
+	ld	e,(hl)		; current phys. Track to E (if DCHG)
+	ld	hl,StCmd+1
+	ld	(hl),a		; Insert DriveCode into Command table
+	ld	a,(LogMsk)
+	and	d		; logged in?
+	jr	z,GetStN	; no: do not check, next Drive
+	dec	hl		; Point to FDC-Command
+	ld	a,ChgCap	; Which change selection method from SYSTEM.LIB
+	and	d
+	jr	nz,RdChg	; Bit set: DCHG supported
+
+	ld	(hl),4		; Command "Sense Drive Status"
+	ld	b,2
+	call	FdcCo1		; output command to FDC (2 bytes)
+GetWP1:	in	a,(FdcSta)
+	rla
+	jr	nc,GetWP1	; wait for FDC-RQM (Request for Master)
+	in	a,(FdcDat)	; read ST3 (Drive Status)
+	and	40h		; WP (Write-Protected) ?
+	jr	z,GetWP2	; no WP : A=0
+	ld	a,d		; WP : A as set the corresponding bit
+GetWP2:	ld	hl,WPmask
+	xor	(hl)		; Compare with previous value
+	and	d		; just look at this bit
+	jr	z,GetWP3	; Unchanged: only set Active-Bit
+
+	xor	(hl)		; Update bit in WP-Mask
+	ld	(hl),a		; save new WP-Word
+	inc	hl
+	ld	a,(hl)		; Active-Mask
+	and	d		; active so far?
+	jr	z,GetWP4	; no: mark as active now
+
+	call	LogOut		; Logout drive
+	ld	hl,Active
+	ld	a,d
+	cpl
+	and	(hl)		; Reset bit in Active-Mask
+	ld	(hl),a
+	jr	GetStN		; check next drive
+
+GetWP3:	inc	hl
+GetWP4:	ld	a,(hl)		; WP change was detected:
+	or	d		; Mark drive as active only
+	ld	(hl),a
+	jr	GetStN
+
+GetStN:	rlc	d		; Continue to move the bit mask
+	ld	a,(StCmd+1)	; previous Drive-Code
+	inc	a		; increase to next drive
+	cp	4
+	jr	c,GetStL	; have we done all Drives 0..3 : continue
+	pop	de		; restore DE
+	jp	TimRet		; End Timer-Interrupt ( C=IOP )
+
+; Examine disk changes based on the DCHG signal.
+; This signal is generated in the drive, and can only be detected by
+; accessing the drive. We do this by performing a Seek command to the
+; drive which latches the status on the DCHG state so it can be read
+; by interrogating the status via the FDC.
+
+RdChg:	ld	(hl),0Fh	; Command "Seek"
+	xor	a
+	ld	(FdcRdy),a	; Reset the FDC Ready-Flag
+	ld	b,2
+	call	FdcCo1		; output the first two bytes of FDC command
+RdChg1:	in	a,(FdcSta)
+	rla
+	jr	nc,RdChg1	; wait until FDC-RQM (Request for Master)
+	in	a,(FdcLDCR)	; /DCHG-Signal --> Bit 7 (inverted)
+	rla
+	push	hl
+	call	c,LogOut	; /DCHG active (low) Drive logout
+	pop	hl
+       	ld	(hl),e		; Destination Track
+	inc	b		; --> =1
+	call	FdcCo1		; output third byte (Track number)
+RdChg2:	ld	a,(FdcRdy)
+	or	a
+	jr	z,RdChg2	; wait for FDC-Interrupt (without TimeOut!)
+	jr	GetStN		; edit next drive
+
+; Logout the current drive. The corresponding bit in the
+; Login Vector is reset, the global media flag in the SCB
+; and set the Media Flag in the DPH for the drive in question.
+
+LogOut:	ld	hl,LogMsk	; --> Login Vector
+	ld	a,d
+	cpl			; Mask 'active L'
+	and	(hl)		; Logout the drive
+	ld	(hl),a		; Save new Login Vector
+	ld	a,(StCmd+1)	; Drive number
+	add	a,a
+	exts	a		; doubled to HL
+	ldw	hl,(hl++DTbl)	; DPH address in HL
+	ld	(hl++11),-1	; Set local Media Flag
+	ld	(@Media),-1	; and Global Media Flag
+	ret
+
+; Interrupt Returns from deactivated sources: correct SP.
+; Do nothing else.
+
+iret4:	inc	sp
+	inc	sp
+iret3:	inc	sp
+	inc	sp
+iret2:	retil			; Ignore Interrupt
+
+; Datenbereich f}r Interrupts
+
+msrsav:	defs	2		; Cache for MSR
+hlsav:	defs	2		; Cache for HL
+asav:	defs	1		; Cache for A
+lastbk:	defb	1		; Store for last selected memory bank
+
+motflg::defb	0		; MotorOn: b0=switched ON, b1=trailing
+    if hard
+delay::	defw	500		; With Hard Drive: 5s Motor-Off-Delay
+    else
+delay::	defw	1500		; Without Hard Drive: 15s Motor-Off-Delay
+    endif
+delcnt:	defw	0		; Counter during Motor-Off-Delay
+
+; *** Danger! Order of the following is important. Also accessed from FORM
+	defb	20		; *** Counter for 0.2s-Int. (counts 20..0)  ***
+    endif	; (if not loader)
+cnt10::	defw	0		; *** Free running down counter (10 ms) ***
+
+    if not loader
+SysCnt	equ	0FFFEh		; 10-ms System counter (up) at address FFFE
+
+StCmd:	defb	0,0,0		; FDC Command list for Seek or Sense Status
+WPmask:	defb	0		; *** Write-Protect-Bitmask
+Active:	defb	0		; *** Active-Bitmask
+LogMsk::defb	0		; *** Drive-Login-Mask
+    endif
+FdcRdy::defb	0		; Flag for End of a R/W/Seek Operation
+
+;***********************************************************************
+;**                 Interrupt / Trap Vector Table                     **
+;***********************************************************************
+
+; This table is copied to 0000 (810000) at boot time. This area in the
+; system bank is then used for the system stack (only about half is
+; really needed).
+
+    if not loader
+itvt::	defw	0,0			; reserved
+	defw	0,NMInt			; NMI --> Warmstart
+	defw	0,iret3			; INTA (ECB)
+	defw	0,iret3			; INTB (RTC/UART)
+	defw	0,FdcInt		; INTC (FDC)
+	defw	i$c,TimInt		; CT0 (Systemtimer)
+	defw	0,iret3			; CT1 (int. UART)
+	defw	0,iret3			; reserved
+	defw	0,iret3			; CT2
+	defw	0,iret3			; DMA0
+	defw	0,iret3			; DMA1
+	defw	0,iret3			; DMA2
+	defw	0,iret3			; DMA3
+	defw	0,iret3			; UART RX
+	defw	0,iret3			; UART TX
+	defw	0,iret2			; SS TRAP
+	defw	0,iret2			; HALT TRAP
+	defw	ints,divtrp		; DIVISION TRAP
+	defw	0,iret3			; STACK OFL
+	defw	ints,acctrp		; ACC VIOLATION
+	defw	ints,syscal		; SC TRAP
+	defw	ints,privil		; PRIV TRAP
+	defw	0,iret4			; EPU
+	defw	0,iret4			; EPU
+	defw	0,iret4			; EPU
+	defw	0,iret4			; EPU
+	defw	0,iret3			; reserved
+	defw	0,iret3			; reserved
+	; (Vector Tables for INTA..INTC omitted)
+
+; Double assignment of the ITVT address (free after booting) is used
+; for the System Stack during User Mode (SC/TRAP/INT) operation (112 bytes).
+
+xstack::
+    endif
+
+	end

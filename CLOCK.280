@@ -1,0 +1,152 @@
+	title	'Real-Time Clock Support Module of CP/M-3 BIOS'
+	.z280
+	.xlist
+	maclib	Z280EQU
+	maclib	CPU280
+	maclib	OPTIONS
+	.list
+
+; 930327 Tilmann Reh
+
+; 10-July-2017 Tony Nicholson
+; Comments translated from German to English (using Google
+; Translate with some appropriate language adjustments resulting
+; from an examination of the instruction sequences).  Also
+; corrected the syntax to be compatible with Hector Peraza's
+; ZSM4 Z80/Z180/Z280 assembler 
+
+; The entire CLOCK Module is in the banked area and may only be accessed
+; via a System Call (unless the CPU is already in System Mode)
+
+	dseg
+
+time::	push	hl
+	push	de		; Save Registers
+	push	bc
+	iopage	boardp
+	pop	bc
+	in	a,(rtc+11)
+	set	7,a
+	out	(rtc+11),a	; 'SET' Bit: stop the clock from updating
+	inc	c
+	jr	z,settime	; C=FF : Set clock
+
+	in	a,(rtc+9)	; Fetch the YEAR (BCD)
+	ld	hl,0		; Convert to days
+	ld	de,365		; usually add 365 days (per year)
+	ld	b,00100010b	; Bit mask for Carry in leap year
+	sub	78h
+cloop:	daa			; Calculate number of years since 1978
+	jr	z,exyear
+	rlc	b
+	adc	hl,de		; add 365 / 366 days
+	dec	a
+	jr	cloop		; Decrement the year BCD to 0
+exyear:	in	a,(rtc+8)	; Read MONTH from clock (BCD)
+	bit	7,b		; Is the current year a leap year?
+	ld	de,dnosw
+	jr	z,nswitch
+	ld	de,dsw		; Load DE with pointer to days of month
+nswitch: ld	b,0		; High-Byte for addition always 0
+mloop:	ex	de,hl
+	ld	c,(hl)		; Read days for the month
+	inc	hl
+	ex	de,hl
+	add	hl,bc		; and add up the total number
+	dec	a
+	daa			; decrement the month (BCD)
+	jr	nz,mloop	; loop until this MONTH is reached
+	sbc	hl,bc		; too much added this month!
+	in	a,(rtc+7)	; Read DAY from clock (BCD)
+	ld	d,a		; BCD to D (16*Z + 1*E)
+	and	0Fh
+	ld	e,a		; units digit to E
+	ld	a,d
+	sub	e		; Tens digit to A (16*Z)
+	rrca
+	rrca			; Tens in A (4*Z)
+	add	a,d		; -> 20*Z + 1*E
+	add	a,e		; -> 20*Z + 2*E
+	rra			; Binary days in A (10*Z + 1*E)
+	add	hl,a		; Add days
+	ld	(@date),hl	; save into SCB
+	in	a,(rtc+4)	; Hours (BCD)
+	ld	(@hour),a	; -> SCB
+	in	a,(rtc+2)	; Minutes (BCD)
+	ld	(@min),a	; -> SCB
+	in	a,(rtc+0)	; Seconds (BCD)
+	ld	(@sec),a	; -> SCB
+clkret:	in	a,(rtc+11)
+	res	7,a
+	out	(rtc+11),a	; 'SET' Allow clock to update again
+	pop	de
+	pop	hl
+	ret
+
+; Setting the clock: Calculate the BCD values from the supplied binary time
+; data (especially the number of days).
+
+settime:ld	hl,(@Date)	; Divide day number by 7 --> Weekday
+	ld	de,0
+	divw	dehl,7		; Result: 0 = Sunday .. 6 = Saturday
+	ld	a,e
+	inc	a		; RTC chip uses days 1..7 (Sunday..Saturday)
+	out	(RTC+6),a	; Set DAYOFWEEK (for DSE switching)
+	ld	hl,(@date)
+	ld	de,365
+	ld	b,00100010b	; Bit mask generates CARRY if leap year
+	ld	a,78h		; Number of days since 1978
+cyloop:	rlc	b
+	sbc	hl,de		; subract 365 or 366
+	jr	c,cyexit
+	jr	z,cyexit	; until we get to negative or zero
+	inc	a
+	daa			; Increment YEAR (BCD)
+	jr	cyloop
+cyexit:	rrc	b
+	adc	hl,de		; Correct the days
+	out	(rtc+9),a	; Write the YEAR to the clock chip
+	bit	7,b		; in B is the leap year mask
+	ld	de,dnosw
+	jr	z,nosw
+	ld	de,dsw		; DE points to days in month table
+nosw:	ld	a,1
+	ld	b,0		; High byte for subtraction always 0
+cmloop:	ex	de,hl
+	ld	c,(hl)		; Read he days in month
+	inc	hl
+	ex	de,hl
+	or	a
+	sbc	hl,bc		; and subtract from the total
+	jr	c,cmexit
+	jr	z,cmexit	; until it becomes zero or negative
+	inc	a
+	daa			; increment MONTH in BCD
+	jr	cmloop
+cmexit:	add	hl,bc		; Correct
+	out	(rtc+8),a	; Write MONTH to the clock chip
+
+calcd:	ld	a,l		; Remaining is DAY
+	cp	10		; convert to BCD
+	jr	c,cd1
+	add	a,6
+	cp	26
+	jr	c,cd1
+	add	a,6
+	cp	42
+	jr	c,cd1
+	add	a,6
+cd1:	out	(rtc+7),a	; Write DAY to clock chip
+	ld	a,(@hour)
+	out	(rtc+4),a	; HOURS -> Clock
+	ld	a,(@min)
+	out	(rtc+2),a	; MINUTES -> Clock
+	ld	a,(@sec)
+	out	(rtc+0),a	; SECONDS -> Clock
+	in	a,(rtc)		; set time on clock chip
+	jp	clkret
+
+dnosw:	defb	31,28,31,30,31,30,31,31,30,31,30,31
+dsw:	defb	31,29,31,30,31,30,31,31,30,31,30,31
+
+	end

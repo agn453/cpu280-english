@@ -1,0 +1,167 @@
+;***********************************************************************
+;**  Port and Global Declarations for CPU280 System Software         **
+;**  950126 Tilmann Reh                                               **
+;***********************************************************************
+
+; 10-July-2017 Tony Nicholson
+; Comments translated from German to English (using Google
+; Translate with some appropriate language adjustments resulting
+; from an examination of the instruction sequences).  Also
+; corrected the syntax to be compatible with Hector Peraza's
+; ZSM4 Z80/Z180/Z280 assembler 
+
+;============================================================
+; I/O-Pages and Onboard-I/O-Addresses:
+;============================================================
+
+busp	equ	0	; I/O Page for External Bus (ECB)
+retip	equ	20h	; I/O Page Onboard & Bus-M1 (RETI)
+boardp	equ	40h	; I/O Page On-Board-I/O
+
+rtc	equ	0	; Base Address (64 Addresses)
+rtca	equ	rtc+10	; Register A
+rtcb	equ	rtc+11	; Register B
+rtcc	equ	rtc+12	; Register C
+rtcd	equ	rtc+13	; Register D
+reti1	equ	rtc+14	; NVRAM : 'Opcode' ED
+reti2	equ	rtc+15	; NVRAM : 'Opcode' 4D
+checklo	equ	rtc+16	; NVRAM : EPROM-Checksum Low-Byte
+checkhi	equ	rtc+17	; NVRAM : EPROM-Checksum High-Byte
+cpufreq	equ	rtc+18	; NVRAM : CPU-Clock (x 614400 Hz)
+
+s$drv0	equ	rtc+19	; Setup : Drive A
+s$drv1	equ	rtc+20	; Setup : Drive B
+s$drv2	equ	rtc+21	; Setup : Drive C
+s$drv3	equ	rtc+22	; Setup : Drive D
+s$c1h	equ	rtc+23	; Setup : CRT1 Hardware-Parameter
+s$c1bd	equ	rtc+24	; Setup : CRT1 Baudrate
+s$c2h	equ	rtc+25	; Setup : CRT2 Hardware-Parameter
+s$c2bd	equ	rtc+26	; Setup : CRT2 Baudrate
+s$ci	equ	rtc+27	; Setup : CI: Device Number
+s$co	equ	rtc+28	; Setup : CO: Device Number
+s$ai	equ	rtc+29	; Setup : AI: Device Number
+s$ao	equ	rtc+30	; Setup : AO: Device Number
+s$lst	equ	rtc+31	; Setup : LST: Device Number
+s$mem	equ	rtc+32	; Setup/Hardwaretest : Memory Expansion (*512k)
+s$dse	equ	rtc+33	; Setup : Summer Time
+s$bdrv	equ	rtc+34	; Setup : Boot Drive
+s$chain	equ	rtc+35	; Setup : Drive Search Chain (4 Byte)
+; next vacant position: rtc+39
+
+fdcsta	equ	40h	; FDC Master Status Register
+fdcdat	equ	41h	; FDC Data (& Command) Register
+fdcdack	equ	60h	; FDC DMA Acknowledge Port
+fdcldor	equ	80h	; FDC Load Operations Register
+fdcldcr	equ	0A0h	; FDC Load Control Register
+uartdat	equ	0C0h	; TP-UART Data Register
+uartctl	equ	0C1h	; TP-UART Control/Status Register
+gpi	equ	0E0h	; GP Input
+
+rts1_en	equ	gpi+0	; RTS1 Bit Output for V.24
+rts1_di	equ	gpi+1
+drv_0	equ	gpi+2	; DRV Bit Output for FDC
+drv_1	equ	gpi+3
+tc_0	equ	gpi+4	; TC Bit Output for FDC
+tc_1	equ	gpi+5
+mot_off	equ	gpi+6	; Motor On Bit Output for FDD's
+mot_on	equ	gpi+7
+warm_0	equ	gpi+8	; Warmstart-Erkennungs-Flag
+warm_1	equ	gpi+9
+ld1_on	equ	gpi+10	; LED 1
+ld1_off	equ	gpi+11
+ld2_on	equ	gpi+12	; LED 2
+ld2_off	equ	gpi+13
+ld3_on	equ	gpi+14	; LED 3
+ld3_off	equ	gpi+15
+
+b$uj1	equ	0	; User-Jumper 1
+b$uj2	equ	1	; User-Jumper 2
+b$uj3	equ	2	; User-Jumper 3
+b$cts1	equ	3	; GPI - Bit CTS1
+b$sqw	equ	4	; GPI - Bit SQW
+b$warm	equ	5	; GPI - Bit WARM
+
+; Bit Masks for Master Status Register and Interrupt Status Register
+
+i$a	equ	1	; Bit Value INTA Interrupt
+i$ct0	equ	2	; Bit Value CT0 and DMA0 Interrupt
+i$b	equ	4	; Bit Value INTB Interrupt
+i$rx	equ	8	; Bit Value CT1, UART Rx and DMA1 Interrupt
+i$c	equ	10h	; Bit Value INTC Interrupt
+i$tx	equ	20h	; Bit Value UART Tx and DMA2 Interrupt
+i$dma3	equ	40h	; Bit Value CT2 and DMA3 Interrupt
+
+;============================================================
+; ASCII Characters
+;============================================================
+
+BEL	equ	7
+TAB	equ	9
+CR	equ	0Dh
+LF	equ	0Ah
+ESC	equ	1Bh
+DEL	equ	7Fh
+
+;============================================================
+; Macro Definitions
+;============================================================
+
+; Switching the Z280 MCU I/O-Page:
+
+iopage	macro	page
+	ld	c,iop
+	ld	l,page
+	ldctl	(c),hl
+	endm
+
+; For calculating the date in CP/M-3-Format (for version data).
+; Before invoking the macro, the variables YEAR, MONTH and DAY must be set.
+; Returns the result in DATE.
+
+ClcDat	macro
+Date	aset	(Year-78)*365 + (Year-77) shr 2 + Day
+	if	((Year and 3) eq 0) and (Month gt 2)
+Date	aset	Date+1
+	endif
+XMonth	aset	Month
+	irp	Md,<31,28,31,30,31,30,31,31,30,31,30,31>
+	if	XMonth gt 1
+Date	aset	Date+Md
+XMonth	aset	XMonth-1
+	endif
+	endm		; IRP
+	endm		; Macro ClcDat
+
+;============================================================
+; Definitions for System-Call-Operands
+;============================================================
+
+; Legal SC Operands are 16-Bit values whose sum of high and low bytes is
+; zero. The actual operand code includes only the lower 8 bits.
+
+sc$bdos		equ	00000h	; still reserved!
+sc$reboot	equ	0FF01h
+sc$dmaset	equ	0FE02h
+sc$setmod	equ	0FD03h
+sc$rbdos	equ	0FC04h
+sc$bnkdos	equ	0FB05h
+sc$tstmod	equ	0FA06h
+sc$smtrap	equ	0F907h
+
+; Also legal are operands whose high byte is 01.  These are for calling
+; the directly accessible BIOS routines (especially for character I/O).
+
+sc$devini	equ	00100h
+sc$const	equ	00101h
+sc$conin	equ	00102h
+sc$conost	equ	00103h
+sc$conout	equ	00104h
+sc$listst	equ	00105h
+sc$list		equ	00106h
+sc$auxist	equ	00107h
+sc$auxin	equ	00108h
+sc$auxost	equ	00109h
+sc$auxout	equ	0010Ah
+sc$time		equ	0010Bh
+sc$movex	equ	0010Ch
+sc$userf	equ	0010Dh

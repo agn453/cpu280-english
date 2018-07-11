@@ -1,0 +1,321 @@
+	title	'Root Module of CP/M-3 BIOS'
+	.z280
+	.xlist
+	maclib	Z280EQU
+	maclib	CPU280
+	maclib	OPTIONS
+    if loader
+	maclib	LDRIO
+    endif
+	.list
+
+; 950126 Tilmann Reh
+
+; 10-July-2017 Tony Nicholson
+; Comments translated from German to English (using Google
+; Translate with some appropriate language adjustments resulting
+; from an examination of the instruction sequences).  Also
+; corrected the syntax to be compatible with Hector Peraza's
+; ZSM4 Z80/Z180/Z280 assembler 
+
+	cseg			; BIOS Jump Table resident
+
+;***********************************************************************
+;**             B I O S   J U M P   V E C T O R                       **
+;***********************************************************************
+
+    if not loader
+
+	jp	Boot		; Coldstart
+WBootE::jp	WBoot		; Warmstart
+	jp	?ConSt		; Con In Status
+	jp	?ConIn		; Con In
+	jp	?ConOut		; Con Out
+	jp	?List		; List Out
+	jp	?AuxOut		; Aux Out
+	jp	?AuxIn		; Aux In
+	jp	Home		; Home for Drives
+	jp	SelDsk		; Select Disk
+	jp	SetTrk		; Set Track
+	jp	SetSec		; Set Sector
+	jp	SetDma		; Set DMA Address
+	jp	Read		; Phys. Sector Read
+	jp	Write		; Phys. Sector Write
+	jp	?ListSt		; List Status
+	jp	SecTrn		; Sector Translation log.-> phys.
+	jp	?ConOst		; Con Out Status
+	jp	?AuxIst		; Aux In Status
+	jp	?AuxOst		; Aux Out Status
+	jp	DevTbl		; Device Table
+	jp	?DevIni		; Set Baudrate (Device init)
+	jp	DrvTbl		; Drive Table
+	jp	MultIO		; Set Multiple IO
+	jp	Flush		; Flush Buffers
+	jp	Move		; Block Move
+	jp	?Time		; Clock Time
+	jp	SelMem		; Bank for CPU
+	jp	SetBnk		; Bank for DMA
+	jp	XMove		; Set MOVE between banks
+	jp	?UserF		; Format-Manager (USERF)
+	jp	0		; Reserved for System
+	jp	0		; Reserved for System
+
+;***********************************************************************
+;**               System Call Jumps                                   **
+;***********************************************************************
+
+; Redirect some BIOS calls to a System Call (SC):
+
+	irp	Name,<ConSt,ConIn,ConOut,List,AuxOut,AuxIn,ListSt>
+?&Name:	sc	sc$&Name
+	ret
+	endm
+
+	irp	Name,<ConOst,AuxIst,AuxOst,DevIni,Time,UserF>
+?&Name:	sc	sc$&Name
+	ret
+	endm
+
+DevTbl:	ld	hl,CTbl		; I/O-DeviceTable
+	ret
+
+	dseg			; banked
+
+DrvTbl:	ld	hl,DTbl		; Drive Table
+	ret
+
+Flush:	xor	a
+	ret			; no error, ignore call
+
+;***********************************************************************
+;**       Switch to I/O-Page BUSP when leaving the BIOS               **
+;***********************************************************************
+
+ResIOP::push	bc
+	ld	b,l
+	iopage	BusP
+	ld	l,b
+	pop	bc
+	ret
+
+    endif
+
+;***********************************************************************
+;**       Output Routines for Strings/Numbers in Hex/Decimal          **
+;***********************************************************************
+
+	dseg
+
+; PMSG Print string at address (HL). 00 = End of string
+
+PMsg::	ld	a,(hl)		; Is it the end?
+	or	a		; NUL ?
+	ret	z		; Yes: RETURN
+    if loader
+	cp	'$'
+	ret	z		; Loader: Also allow '$'
+    endif
+	call	COA		; Output character
+	inc	hl		; point to next
+	jr	PMsg		; and loop until NUL
+
+; HEXADR and HEXBYT output value in HL or A in hexadecimal.
+; HL and DE unchanged, AF and C changed.
+
+HexAdr::ld	a,h		; High-Byte of address
+	call	HexByt
+	ld	a,l		; Low-Byte of address
+HexByt::push	af		; Save Byte (for low-Nibble)
+	rra
+	rra
+	rra
+	rra			; upper nibble down
+	call	Nyb		; Output it
+	pop	af		; lower nibble
+Nyb:	and	0Fh		; mask low bits
+	cp	10
+	ccf			; above 10 : Set Carry
+	adc	a,'0'		; -> 30..39 and 3B..40 (set with Half carry)
+	daa			; -> 30..39 and 41..46
+COA::	ld	c,a
+CO::
+    if loader
+ConOut::outchr	c		; Console Out Macro (public for LDOS)
+    else
+	push	bc
+	push	de		; save all registers (except AF)
+	push	hl
+	sc	sc$conout	; Output character via System Call
+	pop	hl
+	pop	de		; restore registers
+	pop	bc
+    endif
+	ret
+
+; PDEC output value HL (0..65535) in decimal to Console.
+
+PDec::	push	de		; at recursion: save last remainder
+	ld	de,0		; DEHL := HL
+	divuw	dehl,10		; HL = HL/10, DE = Rest
+	call	nz,PDec		; Recursion if tens are present
+	ld	a,e
+	add	a,'0'		; Units -> ASCII in A
+	pop	de		; Restore previous
+	jr	COA		; Output digit
+
+; SIZOUT output value in HL in decimal followed by 'k' (for Drive Sizes).
+; Used by initialisation routines when detecting storage Drive options.
+
+    if not loader
+
+SizOut::call	PDec		; Decimal Output
+	ld	c,'k'
+	jr	CO		; followed by a 'k'
+
+    endif
+
+;***********************************************************************
+;**       Disk-I/O-Entries and Common Routines                        **
+;***********************************************************************
+
+; General Information about the Disk Driver structure:
+; For each drive only one XDPH is needed - each follows the other.
+; DPH contains the entry addresses for the driver (Init, Login, Read, Write
+; with offsets 25, 27, 29 and 31).
+; The disk parameters and specific processing for each drive type are
+; in each driver module.
+; The driver modules contact their own detection routine to determine
+; if the relevant hardware is present and clears the entry in Drive Table
+; if a device is not detected. All driver routines (except Init) must reset
+; the I/O-Page to the ECB-Bus (BusP) prior to returning.  If there is no
+; corresponding driver routine, the address in the XDPH should be 0000h.
+
+
+; Disk Positioning routines: Save values only.  Actual positioning is
+; done at sector read or write.
+; HOME: Is identical to SETTRK 0 (for Floppies an 'Initial Select' causes
+; a FDC-HOME to be performed).
+
+Home::	ld	bc,0
+SetTrk::ld	(Track),bc	; Set Track
+	ret
+
+SetSec::ld	(Sector),bc	; Set Sector
+	ret
+
+SetDMA::ld	(DMA),bc	; log. DMA Address
+	ret
+
+    if not loader
+SetBnk::ld	(DBnk),a	; Set DMA Bank
+	ret
+
+MultIO:	ld	a,c
+	ld	(MltCnt),a	; Set Multi-Sector-Count
+	ret
+    endif
+
+; Sector Translation Tables. For translation, only 8-Bit Sector-
+; Numbers possible, Without translation (TRANS=0) 16 Bit (Hard Disk).
+
+SecTrn::ld	l,c		; log. in BC --> phys. in HL (Table in DE)
+	ld	h,b
+	ld	a,d
+	or	e
+	ret	z		; with DE=0 Return with HL=BC (Skew 1, from 0)
+	ex	de,hl		; Table in HL
+	add	hl,bc		; log. Sector addresses
+	ld	l,(hl)		; Read phys. Sector
+	ld	h,b		; (B=0, since BC was an 8-bit-SectorNumber)
+	ret
+
+; Select Disk: Execute all global functions here.
+; If necessary branch to the appropriate driver. It is
+; the Drive code in C and the Initial-Select-Flag in E.
+
+SelDsk::ld	a,c		; Drive-Code to A
+	ld	(Drive),a	; Drive (0..15 max.)
+	add	a,a
+	exts	a		; HL = 2* Drive
+	ldw	hl,(hl+DTbl)	; DPH Address from table
+	ld	(CurDPH),hl	; Save the current DPH address
+	ld	a,l
+	or	h
+	ret	z		; if 0, Return (Illegal Drive)
+	ldw	hl,(hl+27)	; Login entry from XDPH
+	ld	a,h
+	or	l
+	jp	nz,(hl)		; Call driver, if non-zero
+	ld	hl,(CurDPH)	; load DPH to HL
+	ret
+
+; Reading and Writing of (physical) Sectors:
+
+    if not loader
+Write::	ld	de,31		; Offset to Write routine entry in XDPH
+	jr	DoRW		; common driver for R/W
+    endif
+
+Read::	ld	de,29		; Offset to Read routine entry in XDPH
+
+DoRW:	ld	hl,(CurDPH)	; current XDPH
+	ld	a,h
+	or	l
+	ld	a,1
+	ret	z		; DPH=0 : Return with A=1 (Permanent Error)
+	add	hl,de
+	ldw	hl,(hl)		; Fetch Read/Write routine from XDPH
+	jp	(hl)		; Call it
+
+; Drive Table. Non-existing drives must be defined as 0000 entries!
+; Distribution of log. Drives: A-D in DISKIO, E-G in HALBL, H-P in HARD.
+
+DTbl::	defw	DPHA,DPHB,DPHC,DPHD ; Floppy Disk equipment On-Board
+	defw	DPHE		; MDrive in your own RAM always present
+
+    if ctram
+	defw	DPHF		; If available: c't 1 MB RAM-Disk
+    else
+	defw	0
+    endif
+
+    if ctsolid
+	defw	DPHG		; If available: c't Solid-State-Disk
+    else
+	defw	0
+    endif
+
+  if hard			; If present: Hard Disk (IDE/OMTI)
+    Part aset 0
+    irpc i,<HIJKLMNOP>		; Up to nine possible partitions
+      Part aset Part+1
+      if Part <= Parts
+	defw	DPH&i		; existing partition: enter DPH
+      else
+	defw	0		; otherwise set Null
+      endif
+    endm
+  else
+	defw	0,0,0,0,0,0,0,0,0 ; no HD: Drives H..P not available
+  endif
+
+; Global Variables for Disk-I/O:
+
+CurDPH::defw	0		; Address of current DPH
+Drive::	defb	0		; Logical Drive (0..15)
+Track::	defw	0		; Logical Track (0..65535)
+Sector::defw	0		; Logical Sector (0..65535)
+DMA::	defw	0		; Logical DMA Address
+    if not loader
+MltCnt::defb	0		; Multi-Sector-Count (max. 128)
+DBnk::	defb	0		; Logical DMA-Bank
+    endif
+
+Buffer::defs	128		; General scratch buffer (e.g. AutoFormat)
+    if loader
+	defs	1024-128	; Loader: total 1k as sector buffer!
+BCB::	defb	-1,0,0,0,0,0	; 1 deblocking buffer
+	defw	0,0,Buffer
+    endif
+
+	end
