@@ -1,0 +1,8 @@
+# Default is to keep crlf line endings
+text=auto
+
+README.md text eol=crlf
+*.280 text eol=crlf linguist-language=Assembly
+*.MAC text eol=crlf linguist-language=Assembly
+*.SUB text eol=crlf
+
